@@ -28,8 +28,8 @@ sudo apt install openvpn policykit-1 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.
 ## Setup
 
 ```bash
-git clone <this-repo>
-cd linux-client
+git clone https://github.com/bJauregui-A/watchguard-vpn-linux-client.git
+cd watchguard-vpn-linux-client
 python3 watchguard-vpn-gui.py
 ```
 
