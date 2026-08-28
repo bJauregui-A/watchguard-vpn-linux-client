@@ -1,0 +1,53 @@
+dev tun
+client
+proto tcp-client
+ca "{{CA}}"
+cert "{{CERT}}"
+key "{{KEY}}"
+{{VERIFY_X509_NAME}}
+remote-cert-eku "TLS Web Server Authentication"
+remote {{DOMAIN}} 443
+persist-key
+persist-tun
+verb 3
+# (no keepalive of our own: Fireboxes always push their own "ping X,
+# ping-restart Y" in the PUSH_REPLY and that overrides any value we set
+# here -- confirmed in real logs, so declaring it here is pointless.)
+cipher AES-256-CBC
+data-ciphers AES-256-CBC
+auth SHA256
+float
+reneg-sec 43200
+nobind
+auth-user-pass
+auth-nocache
+tls-version-min 1.2
+# Transport is forced to TCP (proto tcp-client) because the Firebox only
+# accepts SSLVPN on TCP 443 -- there is no UDP option. This means anything
+# that's already TCP inside the tunnel (like SSH) ends up "TCP inside TCP",
+# a known scenario (TCP-over-TCP meltdown) where the two layers'
+# retransmission timers interfere and feel like lag/jitter while typing
+# even when raw bandwidth is fine. tcp-nodelay disables Nagle's algorithm
+# on the tunnel's TCP socket so OpenVPN doesn't buffer small packets (like
+# each SSH keystroke) before sending them -- it doesn't remove the
+# underlying issue but noticeably reduces the perceived delay.
+tcp-nodelay
+# Split-tunnel: only the resources the Firebox pushes via PUSH_REPLY go
+# through the VPN. We tried full-tunnel (redirect-gateway def1) and the
+# Firebox didn't forward general internet traffic -- it just broke the
+# machine's normal connectivity without gaining real browsing.
+#
+# Fireboxes commonly push broad routes (e.g. 10.0.0.0/8) that can swallow
+# local networks that also use those ranges (home WiFi routers, for
+# example), breaking the control connection -- and those same broad routes
+# sometimes include the Firebox's own public IP, which would break
+# reconnection. route-up.sh re-installs more specific routes back to the
+# local network AND to the Firebox itself so they coexist without
+# stepping on each other (the "save the original route" part is done by
+# vpn_routes.py before connecting, not by an --up script, because that
+# hook overrode OpenVPN's automatic DNS handling). route-down.sh removes
+# that extra host route again on disconnect, so it doesn't linger and
+# shadow a different, more specific route to that same IP later.
+script-security 2
+route-up {{ROUTE_UP}}
+route-pre-down {{ROUTE_DOWN}}

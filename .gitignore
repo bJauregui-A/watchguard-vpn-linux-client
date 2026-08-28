@@ -1,0 +1,19 @@
+# Firebox/server certificates -- these are real access credentials, never
+# commit them. In normal use they don't live in the project directory at
+# all (they're stored per-domain under
+# ~/.local/share/watchguard-vpn-linux-client/profiles/<domain>/), this is
+# just a safety net in case any get placed here directly.
+ca.crt
+client.crt
+client.pem
+*.pem
+*.key
+client.ovpn
+auth.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime state / logs the app can generate locally
+*.log
