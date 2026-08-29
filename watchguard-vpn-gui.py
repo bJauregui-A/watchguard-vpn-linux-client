@@ -30,6 +30,7 @@ Built with Claude Code (https://claude.com/claude-code).
 Requires: gtk3, webkit2gtk (4.1), polkit (pkexec), openvpn.
 """
 import os
+import tempfile
 import threading
 from urllib.parse import urlparse, parse_qs
 
@@ -156,6 +157,7 @@ class VpnWindow(Gtk.Window):
         self.np_saml_group_entry.set_text(profile.get("saml_auth_group") or "")
         self._np_cert_folder = None
         self.np_cert_path_label.set_text("(keep existing certificates)")
+        self.np_cert_fetch_btn.set_sensitive(True)
         self.np_error_label.set_text("")
         self.stack.set_visible_child_name("new_profile")
 
@@ -168,6 +170,7 @@ class VpnWindow(Gtk.Window):
         self.np_saml_group_entry.set_text("")
         self._np_cert_folder = None
         self.np_cert_path_label.set_text("(none chosen)")
+        self.np_cert_fetch_btn.set_sensitive(True)
         self.np_error_label.set_text("")
         self.stack.set_visible_child_name("new_profile")
 
@@ -213,12 +216,12 @@ class VpnWindow(Gtk.Window):
 
         saml_group_label = Gtk.Label(label="SAML auth group\n(leave empty if unsure):", xalign=0)
         saml_group_label.set_tooltip_text(
-            "Only needed if this Firebox has multiple SAML auth servers "
-            "configured -- it's NOT part of the certificates, it's a "
-            "server-side name. Wrong (or wrongly empty) here fails with "
-            "AUTH_FAILED even with valid certs and a valid SAML login. "
-            "Ask the server admin, or check a working official-client "
-            "install for this same domain."
+            "Auto-filled by \"Fetch automatically\" below, if the "
+            "Firebox reports one -- edit it here only if that didn't "
+            "run, got it wrong, or you need to override it. It's a "
+            "server-side name, not part of the certificates. Wrong (or "
+            "wrongly empty when needed) fails with AUTH_FAILED even "
+            "with valid certs and a valid SAML login."
         )
         grid.attach(saml_group_label, 0, 2, 1, 1)
         self.np_saml_group_entry = Gtk.Entry()
@@ -226,22 +229,31 @@ class VpnWindow(Gtk.Window):
         self.np_saml_group_entry.set_tooltip_text(saml_group_label.get_tooltip_text())
         grid.attach(self.np_saml_group_entry, 1, 2, 1, 1)
 
-        grid.attach(Gtk.Label(label="Folder with ca.crt / client.crt / client.pem:", xalign=0), 0, 3, 1, 1)
+        grid.attach(Gtk.Label(label="Certificates (ca.crt / client.crt / client.pem):", xalign=0), 0, 3, 1, 1)
         cert_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.np_cert_path_label = Gtk.Label(label="(none chosen)")
         self.np_cert_path_label.get_style_context().add_class("dim-label")
+        self.np_cert_fetch_btn = Gtk.Button(label="Fetch automatically")
+        self.np_cert_fetch_btn.connect("clicked", self._on_fetch_cert_clicked)
         cert_choose_btn = Gtk.Button(label="Choose folder...")
         cert_choose_btn.connect("clicked", self._on_choose_cert_folder)
         cert_box.pack_start(self.np_cert_path_label, True, True, 0)
+        cert_box.pack_start(self.np_cert_fetch_btn, False, False, 0)
         cert_box.pack_start(cert_choose_btn, False, False, 0)
         grid.attach(cert_box, 1, 3, 1, 1)
         self._np_cert_folder = None
 
         hint = Gtk.Label(
             label=(
-                "Those 3 files are pulled once from a Windows install of the "
-                "official client for that domain, under "
-                "%AppData%\\WatchGuard\\Mobile VPN\\."
+                "\"Fetch automatically\" downloads the certificates AND "
+                "detects the login mode/SAML auth group, straight from "
+                "the Firebox (same unauthenticated endpoints the "
+                "official client uses on first add) -- no manual "
+                "extraction needed. \"Choose folder...\" is the "
+                "fallback for the certificates: those 3 files pulled "
+                "once from a Windows install of the official client, "
+                "under %AppData%\\WatchGuard\\Mobile VPN\\, if automatic "
+                "fetch doesn't work for some reason."
             )
         )
         hint.set_line_wrap(True)
@@ -277,6 +289,58 @@ class VpnWindow(Gtk.Window):
             self._np_cert_folder = dialog.get_filename()
             self.np_cert_path_label.set_text(self._np_cert_folder)
         dialog.destroy()
+
+    def _on_fetch_cert_clicked(self, _button) -> None:
+        domain = self.np_domain_entry.get_text().strip()
+        if not domain:
+            self.np_error_label.set_text("Enter the domain first.")
+            return
+        self.np_error_label.set_text("")
+        self.np_cert_fetch_btn.set_sensitive(False)
+        self.np_cert_path_label.set_text("Fetching...")
+        threading.Thread(
+            target=self._fetch_cert_worker, args=(domain,), daemon=True
+        ).start()
+
+    def _fetch_cert_worker(self, domain: str) -> None:
+        staging_dir = tempfile.mkdtemp(prefix="watchguard-vpn-fetch-")
+        try:
+            vpn_network.fetch_certificates_to_dir(domain, staging_dir)
+        except Exception as e:
+            GLib.idle_add(self._on_fetch_cert_done, domain, None, str(e), None)
+            return
+        # Best-effort: the SAML auth group comes from a separate,
+        # unrelated endpoint. A cert-only Firebox (SAML not configured)
+        # is a normal case, not a failure -- don't fail the whole fetch
+        # over it, just leave the group field alone if this errors.
+        try:
+            login_config = vpn_network.fetch_login_config(domain)
+        except Exception:
+            login_config = None
+        GLib.idle_add(self._on_fetch_cert_done, domain, staging_dir, None, login_config)
+
+    def _on_fetch_cert_done(self, domain: str, staging_dir, error, login_config) -> None:
+        self.np_cert_fetch_btn.set_sensitive(True)
+        # The user may have edited the domain field while this was in
+        # flight -- if it no longer matches what we fetched for, discard
+        # the result rather than silently applying it to the wrong domain.
+        if self.np_domain_entry.get_text().strip() != domain:
+            self.np_cert_path_label.set_text("(none chosen)")
+            return
+        if error:
+            self.np_cert_path_label.set_text("(none chosen)")
+            self.np_error_label.set_text(f"Automatic fetch failed: {error}")
+            return
+        self._np_cert_folder = staging_dir
+        self.np_cert_path_label.set_text(f"Fetched automatically from {domain}")
+
+        if login_config:
+            if login_config["saml_enabled"]:
+                self.np_saml_radio.set_active(True)
+            elif login_config["auth_domains"]:
+                self.np_cred_radio.set_active(True)
+            if login_config["saml_idp_name"]:
+                self.np_saml_group_entry.set_text(login_config["saml_idp_name"])
 
     def _on_save_new_profile(self, _button) -> None:
         domain = self.np_domain_entry.get_text().strip()

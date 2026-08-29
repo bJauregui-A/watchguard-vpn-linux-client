@@ -54,39 +54,67 @@ per-domain certificates, generated OpenVPN configs) is kept under
 
 ### Adding a server (domain)
 
-From the app: **"+ Add new domain"** and fill in:
+From the app: **"+ Add new domain"**, enter the **domain** (e.g.
+`vpn.example.com`) and click **"Fetch automatically"** — this pulls the
+certificates and detects the login mode/SAML auth group in one step (see
+below for how). Review what it filled in, then **Save**:
 
-- **Domain**: the server hostname (e.g. `vpn.example.com`).
 - **Login mode**: SAML (SSO, opens an embedded browser) or
-  username/password (submitted directly).
+  username/password (submitted directly) — pre-selected from what the
+  Firebox reports, but you can override it.
 - **SAML auth group** *(optional)*: the SAML IdP/auth-server name
   configured on that Firebox, prefixed to the username for OpenVPN auth
-  (`<group>\<user>`). It is **not** part of the certificate bundle — it's
-  a server-side name, so it can't be extracted automatically. Required
-  only if that server's SAML config uses one; ask the server
-  administrator, or inspect the official client's config for that domain
-  if you have access to one. Leaving it blank when the server actually
-  needs one fails with `AUTH_FAILED` right after a successful SAML login
-  and valid certs, which can look like a certificate or routing problem
-  but isn't.
-- **Certificate folder**: a folder containing `ca.crt`, `client.crt` and
-  `client.pem` for that server (see below).
+  (`<group>\<user>`). Auto-filled when the Firebox reports one; edit it
+  yourself if that didn't happen, got it wrong, or needs overriding.
+  Leaving it blank when the server actually needs one fails with
+  `AUTH_FAILED` right after a successful SAML login and valid certs,
+  which can look like a certificate or routing problem but isn't.
+- **Certificate folder**: only needed if "Fetch automatically" didn't
+  work — a folder containing `ca.crt`, `client.crt` and `client.pem` for
+  that server (see below for the manual fallback).
 
-### Where the certificates come from
+An existing profile can be edited later too (**Edit** button on its row),
+to change any of the above without deleting and re-adding it.
 
-WatchGuard doesn't expose a public way to download `ca.crt` / `client.crt`
-/ `client.pem` directly. The official Windows/macOS client fetches and
-decrypts them internally from an encrypted blob (`client.wgssl`) served by
-the Firebox when a domain is added there. This client does not automate
-that step — you need to obtain the three files once from a real install of
-the official client for that domain:
+### Where the certificates and SAML group come from
+
+Both come straight from the Firebox itself, via two unauthenticated
+endpoints the official Windows/macOS client also uses the first time a
+domain is added there (found by inspecting that traffic with a
+MITM proxy against a real Firebox):
+
+- `GET https://<domain>/?action=sslvpn_download&filename=client.wgssl`
+  returns the device certificate bundle. Despite the name/extension
+  suggesting encryption, it's just `gzip(tar(ca.crt, client.crt,
+  client.pem, ...))` — no crypto involved.
+- `GET https://<domain>/?action=sslvpn_logon&style=fw_logon.xsl&fw_logon_type=status`
+  returns a small XML status document (`saml_enabled`, `saml_idp_name`,
+  `auth-domain-list`) describing the configured login mode(s) — this is
+  where the SAML auth group actually comes from.
+
+Neither endpoint requires a session, cookie, or credential of any kind —
+confirmed by fetching both anonymously and comparing byte-for-byte
+against what the official client received. Worth knowing if you
+administer a Firebox: anyone who knows its SSLVPN portal hostname can
+pull a valid device certificate + private key this way. That's mTLS
+trust for the tunnel, not a full login by itself (a valid `auth-user-pass`
+is still required afterwards), but it is unauthenticated access to real
+key material.
+
+The certificates are issued for the Firebox device itself, not
+per-user/per-session — they don't need to be re-fetched on every login,
+only once per server (until that server's certificate is rotated).
+
+**Manual fallback**, if automatic fetch doesn't work for some reason
+(e.g. that endpoint is firewalled off, or the Firebox is old enough not
+to have it): obtain the three cert files once from a real install of the
+official client for that domain —
 
 - **Windows**: `%AppData%\WatchGuard\Mobile VPN\`
 - **macOS**: equivalent path under the official client's profile data
 
-These are certificates issued for the Firebox device itself, not
-per-user/per-session — they don't need to be re-extracted on every login,
-only once per server (until that server's certificate is rotated).
+— and point "Choose folder..." at them instead. The SAML auth group
+would then need asking the server administrator.
 
 ## How it works
 

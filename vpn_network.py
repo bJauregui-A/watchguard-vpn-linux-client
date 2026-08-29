@@ -7,10 +7,18 @@ Pure functions -- no GTK. These are meant to be called from a background
 thread; callers are responsible for marshalling results back onto the
 GTK main loop (GLib.idle_add) themselves.
 """
+import gzip
+import io
 import os
 import re
 import subprocess
+import tarfile
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
 from typing import Callable, Iterable, Optional, Tuple
+
+CERT_FILES = ("ca.crt", "client.crt", "client.pem")
 
 
 def check_wifi_health() -> Optional[str]:
@@ -47,6 +55,88 @@ def check_wifi_health() -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def fetch_certificates_to_dir(domain: str, dest_dir: str) -> None:
+    """Downloads the Firebox's device certificate bundle and writes
+    ca.crt/client.crt/client.pem into dest_dir.
+
+    This is WatchGuard's own device-provisioning endpoint, the same one
+    the official Windows/macOS client uses the first time a domain is
+    added there (found by MITM-inspecting that traffic against a real
+    Firebox). Despite the .wgssl extension suggesting encryption, the
+    response is just gzip(tar(ca.crt, client.crt, client.pem, ...)) --
+    no crypto at all. It also requires no authentication whatsoever: any
+    request that reaches the Firebox's SSLVPN portal gets the same
+    device cert bundle back, unauthenticated -- confirmed by fetching it
+    with a plain anonymous request and comparing MD5s against what the
+    official client downloaded. That's a real device certificate/key
+    (mTLS trust for the tunnel), not a login by itself -- the server
+    still requires a valid auth-user-pass afterwards -- but it does mean
+    anyone who knows a Firebox's hostname can pull this, worth being
+    aware of if you administer one.
+
+    Raises OSError/ValueError (via urllib, gzip, or tarfile) on any
+    failure -- network error, non-200 response, unexpected format, or a
+    bundle missing one of the three files. Caller's problem to catch and
+    show the user something sensible.
+    """
+    url = f"https://{domain}/?action=sslvpn_download&filename=client.wgssl"
+    with urllib.request.urlopen(url, timeout=15) as resp:
+        raw = resp.read()
+    tar_bytes = gzip.decompress(raw)
+    os.makedirs(dest_dir, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as tar:
+        names = set(tar.getnames())
+        missing = [name for name in CERT_FILES if name not in names]
+        if missing:
+            raise ValueError(
+                f"Bundle from {domain} is missing: {', '.join(missing)}"
+            )
+        for name in CERT_FILES:
+            data = tar.extractfile(name).read()
+            path = os.path.join(dest_dir, name)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+
+
+def fetch_login_config(domain: str) -> dict:
+    """Asks the Firebox what login modes/realms it has configured, via
+    the same unauthenticated status check the official client polls
+    before showing its login UI.
+
+    Found the same way as fetch_certificates_to_dir: MITM-inspecting a
+    real official-client session. This is a SEPARATE endpoint from the
+    device cert bundle -- it's what actually answers the "what's the
+    SAML auth group?" question we couldn't find in the SAML AuthnRequest
+    or in the cert bundle's client.ovpn template. Confirmed with a plain
+    anonymous request too, no session/auth needed.
+
+    Returns {"saml_enabled": bool, "saml_idp_name": str, "auth_domains":
+    [str, ...]}. saml_idp_name is "" if SAML isn't configured (or the
+    Firebox didn't name one -- some setups don't need a group prefix at
+    all). auth_domains lists the realm(s) available for direct
+    username/password login (e.g. "Firebox-DB").
+
+    Raises OSError/ValueError on any failure (network, non-200, or a
+    response that isn't the expected XML shape).
+    """
+    url = f"https://{domain}/?action=sslvpn_logon&style=fw_logon.xsl&fw_logon_type=status"
+    with urllib.request.urlopen(url, timeout=15) as resp:
+        raw = resp.read()
+    root = ET.fromstring(raw)
+    saml_enabled = (root.findtext("saml_enabled") or "0") == "1"
+    saml_idp_name = root.findtext("saml_idp_name") or ""
+    auth_domains = [
+        el.findtext("name") or ""
+        for el in root.findall("./auth-domain-list/auth-domain")
+    ]
+    return {
+        "saml_enabled": saml_enabled,
+        "saml_idp_name": saml_idp_name,
+        "auth_domains": [d for d in auth_domains if d],
+    }
 
 
 def run_connection_test(
