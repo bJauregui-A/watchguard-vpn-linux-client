@@ -43,8 +43,8 @@ responsibility rather than one monolithic script:
   stream/parse its log, disconnect). Decoupled from the UI via callbacks.
 - `vpn_routes.py` — route capture/cleanup around the tunnel, and
   installs `route-up.sh`/`route-down.sh` into the app's data directory.
-- `vpn_network.py` — wifi health check and the "Test connection" ping
-  check.
+- `vpn_network.py` — wifi health check, the "Test connection" ping
+  check, and fetching certificates/SAML auth group from the Firebox.
 - `vpn_profiles.py` — profile storage (which domains are configured).
 
 All five must stay together in the same directory (plain sibling
@@ -182,7 +182,14 @@ real access credentials for whatever Firebox they belong to. Never commit
 them to a repository — this project's `.gitignore` excludes common
 certificate/key filenames as a safety net, but they are not meant to live
 inside the project directory at all in normal use (see "Where the
-certificates come from" above).
+certificates and SAML group come from" above).
+
+## Trademark
+
+WatchGuard® and Firebox® are registered trademarks of WatchGuard
+Technologies, Inc. This is an independent, unofficial project, not
+affiliated with, endorsed by, or sponsored by WatchGuard. The name is
+used only to describe what this client is compatible with.
 
 ## License
 
