@@ -25,6 +25,8 @@ On Debian/Ubuntu:
 sudo apt install openvpn policykit-1 python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1
 ```
 
+Tested on **Arch Linux** and **Linux Mint**.
+
 ## Setup
 
 ```bash
