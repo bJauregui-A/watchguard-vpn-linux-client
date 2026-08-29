@@ -55,6 +55,7 @@ class VpnWindow(Gtk.Window):
         self.active_profile = None
         self.profiles = vpn_profiles.load_profiles()
         self._saml_login_cancellable = None  # guards against stale domain switches, see _clear_saml_cookie_and_load_login
+        self._np_editing_domain = None  # non-None while the new/edit-domain form is editing an existing profile
 
         self.vpn = VpnProcess(
             on_log_line=self.append_log_line,
@@ -93,7 +94,7 @@ class VpnWindow(Gtk.Window):
         box.pack_start(self.profiles_list_box, True, True, 0)
 
         add_button = Gtk.Button(label="+ Add new domain")
-        add_button.connect("clicked", lambda _b: self.stack.set_visible_child_name("new_profile"))
+        add_button.connect("clicked", self._on_add_new_domain_clicked)
         box.pack_start(add_button, False, False, 0)
 
         self.stack.add_named(box, "profiles")
@@ -120,10 +121,13 @@ class VpnWindow(Gtk.Window):
                 label.set_xalign(0)
                 connect_btn = Gtk.Button(label="Connect")
                 connect_btn.connect("clicked", self._on_profile_chosen, profile)
+                edit_btn = Gtk.Button(label="Edit")
+                edit_btn.connect("clicked", self._on_profile_edit_clicked, profile)
                 remove_btn = Gtk.Button(label="Remove")
                 remove_btn.connect("clicked", self._on_profile_removed, profile)
                 row_box.pack_start(label, True, True, 0)
                 row_box.pack_start(connect_btn, False, False, 0)
+                row_box.pack_start(edit_btn, False, False, 0)
                 row_box.pack_start(remove_btn, False, False, 0)
                 row = Gtk.ListBoxRow()
                 row.add(row_box)
@@ -135,6 +139,37 @@ class VpnWindow(Gtk.Window):
         self.profiles = [p for p in self.profiles if p["domain"] != profile["domain"]]
         vpn_profiles.save_profiles(self.profiles)
         self._refresh_profiles_list()
+
+    def _on_profile_edit_clicked(self, _button, profile: dict) -> None:
+        self._np_editing_domain = profile["domain"]
+        self.np_form_title.set_text(f"Edit {profile['domain']}")
+        self.np_domain_entry.set_text(profile["domain"])
+        # The domain is part of the on-disk cert path and every generated
+        # config/route -- renaming it here would silently orphan the
+        # existing profiles/<domain>/ folder, so editing is scoped to the
+        # other fields only.
+        self.np_domain_entry.set_sensitive(False)
+        if profile["auth_mode"] == "saml":
+            self.np_saml_radio.set_active(True)
+        else:
+            self.np_cred_radio.set_active(True)
+        self.np_saml_group_entry.set_text(profile.get("saml_auth_group") or "")
+        self._np_cert_folder = None
+        self.np_cert_path_label.set_text("(keep existing certificates)")
+        self.np_error_label.set_text("")
+        self.stack.set_visible_child_name("new_profile")
+
+    def _on_add_new_domain_clicked(self, _button) -> None:
+        self._np_editing_domain = None
+        self.np_form_title.set_text("New domain")
+        self.np_domain_entry.set_text("")
+        self.np_domain_entry.set_sensitive(True)
+        self.np_saml_radio.set_active(True)
+        self.np_saml_group_entry.set_text("")
+        self._np_cert_folder = None
+        self.np_cert_path_label.set_text("(none chosen)")
+        self.np_error_label.set_text("")
+        self.stack.set_visible_child_name("new_profile")
 
     def _on_profile_chosen(self, _button, profile: dict) -> None:
         self.active_profile = profile
@@ -155,9 +190,9 @@ class VpnWindow(Gtk.Window):
         box.set_margin_top(24)
         box.set_margin_bottom(24)
 
-        title = Gtk.Label(label="New domain")
-        title.get_style_context().add_class("title")
-        box.pack_start(title, False, False, 0)
+        self.np_form_title = Gtk.Label(label="New domain")
+        self.np_form_title.get_style_context().add_class("title")
+        box.pack_start(self.np_form_title, False, False, 0)
 
         grid = Gtk.Grid(row_spacing=8, column_spacing=8)
         box.pack_start(grid, False, False, 0)
@@ -176,12 +211,19 @@ class VpnWindow(Gtk.Window):
         mode_box.pack_start(self.np_cred_radio, False, False, 0)
         grid.attach(mode_box, 1, 1, 1, 1)
 
-        grid.attach(
-            Gtk.Label(label="SAML auth group\n(optional, leave empty if unsure):", xalign=0),
-            0, 2, 1, 1,
+        saml_group_label = Gtk.Label(label="SAML auth group\n(leave empty if unsure):", xalign=0)
+        saml_group_label.set_tooltip_text(
+            "Only needed if this Firebox has multiple SAML auth servers "
+            "configured -- it's NOT part of the certificates, it's a "
+            "server-side name. Wrong (or wrongly empty) here fails with "
+            "AUTH_FAILED even with valid certs and a valid SAML login. "
+            "Ask the server admin, or check a working official-client "
+            "install for this same domain."
         )
+        grid.attach(saml_group_label, 0, 2, 1, 1)
         self.np_saml_group_entry = Gtk.Entry()
         self.np_saml_group_entry.set_placeholder_text("e.g. Corp_SAML")
+        self.np_saml_group_entry.set_tooltip_text(saml_group_label.get_tooltip_text())
         grid.attach(self.np_saml_group_entry, 1, 2, 1, 1)
 
         grid.attach(Gtk.Label(label="Folder with ca.crt / client.crt / client.pem:", xalign=0), 0, 3, 1, 1)
@@ -238,46 +280,62 @@ class VpnWindow(Gtk.Window):
 
     def _on_save_new_profile(self, _button) -> None:
         domain = self.np_domain_entry.get_text().strip()
+        editing = self._np_editing_domain is not None
         if not domain:
             self.np_error_label.set_text("Domain is missing.")
             return
-        if any(p["domain"] == domain for p in self.profiles):
+        if not editing and any(p["domain"] == domain for p in self.profiles):
             self.np_error_label.set_text("A profile for that domain already exists.")
             return
-        if not self._np_cert_folder:
+        if not editing and not self._np_cert_folder:
             self.np_error_label.set_text("Choose the certificate folder first.")
             return
 
-        missing = [
-            name for name in ("ca.crt", "client.crt", "client.pem")
-            if not os.path.isfile(os.path.join(self._np_cert_folder, name))
-        ]
-        if missing:
-            self.np_error_label.set_text(
-                f"Missing in that folder: {', '.join(missing)}"
-            )
-            return
+        # In edit mode the cert folder is optional (existing certs are
+        # kept as-is unless a new folder is picked); in add mode it's
+        # already required above, so this always runs there.
+        if self._np_cert_folder:
+            missing = [
+                name for name in ("ca.crt", "client.crt", "client.pem")
+                if not os.path.isfile(os.path.join(self._np_cert_folder, name))
+            ]
+            if missing:
+                self.np_error_label.set_text(
+                    f"Missing in that folder: {', '.join(missing)}"
+                )
+                return
 
-        dest_dir = vpn_profiles.profile_cert_dir(domain)
-        os.makedirs(dest_dir, exist_ok=True)
-        for name in ("ca.crt", "client.crt", "client.pem"):
-            src = os.path.join(self._np_cert_folder, name)
-            dst = os.path.join(dest_dir, name)
-            with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
-                fdst.write(fsrc.read())
-        os.chmod(os.path.join(dest_dir, "client.pem"), 0o600)
+            dest_dir = vpn_profiles.profile_cert_dir(domain)
+            os.makedirs(dest_dir, exist_ok=True)
+            for name in ("ca.crt", "client.crt", "client.pem"):
+                src = os.path.join(self._np_cert_folder, name)
+                dst = os.path.join(dest_dir, name)
+                with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+                    fdst.write(fsrc.read())
+            os.chmod(os.path.join(dest_dir, "client.pem"), 0o600)
 
-        profile = {
-            "domain": domain,
-            "label": domain,
-            "auth_mode": "saml" if self.np_saml_radio.get_active() else "credentials",
-            "saml_auth_group": self.np_saml_group_entry.get_text().strip(),
-            "verify_x509_name": "",
-        }
-        self.profiles.append(profile)
+        auth_mode = "saml" if self.np_saml_radio.get_active() else "credentials"
+        saml_auth_group = self.np_saml_group_entry.get_text().strip()
+
+        if editing:
+            for p in self.profiles:
+                if p["domain"] == domain:
+                    p["auth_mode"] = auth_mode
+                    p["saml_auth_group"] = saml_auth_group
+                    break
+        else:
+            self.profiles.append({
+                "domain": domain,
+                "label": domain,
+                "auth_mode": auth_mode,
+                "saml_auth_group": saml_auth_group,
+                "verify_x509_name": "",
+            })
         vpn_profiles.save_profiles(self.profiles)
 
+        self._np_editing_domain = None
         self.np_domain_entry.set_text("")
+        self.np_domain_entry.set_sensitive(True)
         self.np_saml_group_entry.set_text("")
         self.np_cert_path_label.set_text("(none chosen)")
         self._np_cert_folder = None

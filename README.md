@@ -61,9 +61,14 @@ From the app: **"+ Add new domain"** and fill in:
   username/password (submitted directly).
 - **SAML auth group** *(optional)*: the SAML IdP/auth-server name
   configured on that Firebox, prefixed to the username for OpenVPN auth
-  (`<group>\<user>`). Required only if that server's SAML config uses one;
-  ask the server administrator, or inspect the official client's config
-  for that domain if you have access to one.
+  (`<group>\<user>`). It is **not** part of the certificate bundle — it's
+  a server-side name, so it can't be extracted automatically. Required
+  only if that server's SAML config uses one; ask the server
+  administrator, or inspect the official client's config for that domain
+  if you have access to one. Leaving it blank when the server actually
+  needs one fails with `AUTH_FAILED` right after a successful SAML login
+  and valid certs, which can look like a certificate or routing problem
+  but isn't.
 - **Certificate folder**: a folder containing `ca.crt`, `client.crt` and
   `client.pem` for that server (see below).
 
