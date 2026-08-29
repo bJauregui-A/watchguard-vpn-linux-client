@@ -8,6 +8,7 @@ client.crt
 client.pem
 *.pem
 *.key
+*.wgssl
 client.ovpn
 auth.txt
 
