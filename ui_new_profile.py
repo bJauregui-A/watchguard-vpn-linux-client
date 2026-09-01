@@ -11,11 +11,13 @@ import os
 import tempfile
 import threading
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, GLib  # noqa: E402
+gi.require_version("WebKit2", "4.1")
+from gi.repository import Gtk, GLib, Gio, WebKit2  # noqa: E402
 
 import vpn_network
 import vpn_profiles
@@ -29,6 +31,8 @@ class NewProfileView:
 
         self._editing_domain: Optional[str] = None
         self._cert_folder: Optional[str] = None
+        self._login_fallback_domain: Optional[str] = None  # non-None while the embedded login-first-then-retry flow (see below) is active
+        self._login_cancellable = None  # guards the login webview's cookie-clear against a stale/overlapping attempt, same pattern as ui_saml_login.py
 
         self.widget = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.widget.set_border_width(24)
@@ -103,6 +107,35 @@ class NewProfileView:
         self.error_label.set_line_wrap(True)
         self.widget.pack_start(self.error_label, False, False, 0)
 
+        # Fallback shown only when an anonymous "Fetch automatically" fails
+        # on a SAML-enabled Firebox: found (2026-09-01, MITM-comparing a
+        # real official-client capture against our own request byte-for-
+        # byte) that at least one real Firebox now requires a just-completed
+        # login from the same client before it will serve the cert bundle,
+        # something it didn't need when this endpoint was first reverse-
+        # engineered -- likely tightened as a direct response to exactly the
+        # "unauthenticated cert pull" concern this project's own README
+        # flags. A login here doesn't need to be kept or used for anything
+        # afterward -- its only purpose is to unlock the retry below; the
+        # real connection later does its own fresh login regardless.
+        self.login_fallback_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        login_fallback_label = Gtk.Label(
+            label=(
+                "This server didn't allow fetching certificates "
+                "anonymously. Some Fireboxes require a login first -- log "
+                "in below and the fetch will retry automatically."
+            )
+        )
+        login_fallback_label.set_line_wrap(True)
+        self.login_webview = WebKit2.WebView()
+        self.login_webview.set_size_request(-1, 320)
+        self.login_webview.connect("load-changed", self._on_login_webview_load_changed)
+        self.login_fallback_box.pack_start(login_fallback_label, False, False, 0)
+        self.login_fallback_box.pack_start(self.login_webview, True, True, 0)
+        self.login_fallback_box.set_no_show_all(True)
+        self.login_fallback_box.hide()
+        self.widget.pack_start(self.login_fallback_box, True, True, 0)
+
         btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         back_btn = Gtk.Button(label="Back")
         back_btn.connect("clicked", lambda _b: self._on_back())
@@ -143,6 +176,7 @@ class NewProfileView:
         self.cert_path_label.set_text(cert_label)
         self.cert_fetch_btn.set_sensitive(True)
         self.error_label.set_text("")
+        self._hide_login_fallback()
 
     def _on_choose_cert_folder(self, _button) -> None:
         dialog = Gtk.FileChooserDialog(
@@ -196,8 +230,33 @@ class NewProfileView:
         try:
             vpn_network.fetch_certificates_to_dir(domain, staging_dir)
         except Exception as e:
+            # Some Fireboxes now reject this anonymous request but accept
+            # it right after a real login from the same client (see the
+            # login_fallback_box comment above) -- worth trying that before
+            # giving up, but only for SAML domains, since that's the only
+            # login flow we can drive ourselves without asking for
+            # credentials mid-fetch.
+            if login_config and login_config.get("saml_enabled"):
+                GLib.idle_add(self._start_login_fallback, domain)
+            else:
+                GLib.idle_add(self._on_fetch_cert_done, domain, None, str(e), None)
+            return
+        GLib.idle_add(self._on_fetch_cert_done, domain, staging_dir, None, login_config)
+
+    def _retry_cert_fetch_after_login(self, domain: str) -> None:
+        """Same as _fetch_cert_worker, but called after the login-fallback
+        webview reports a completed login -- no need to re-check
+        saml_enabled or fall back again, this IS the fallback."""
+        staging_dir = tempfile.mkdtemp(prefix="watchguard-vpn-fetch-")
+        try:
+            vpn_network.fetch_certificates_to_dir(domain, staging_dir)
+        except Exception as e:
             GLib.idle_add(self._on_fetch_cert_done, domain, None, str(e), None)
             return
+        try:
+            login_config = vpn_network.fetch_login_config(domain)
+        except Exception:
+            login_config = None
         GLib.idle_add(self._on_fetch_cert_done, domain, staging_dir, None, login_config)
 
     def _on_fetch_cert_done(self, domain: str, staging_dir, error, login_config) -> None:
@@ -222,6 +281,71 @@ class NewProfileView:
                 self.cred_radio.set_active(True)
             if login_config["saml_idp_name"]:
                 self.saml_group_entry.set_text(login_config["saml_idp_name"])
+
+    # ---------- login-first fallback (see login_fallback_box comment above) ----------
+
+    def _start_login_fallback(self, domain: str) -> None:
+        self._login_fallback_domain = domain
+        self.cert_path_label.set_text("(login required, see below)")
+        self.error_label.set_text("")
+        self.login_fallback_box.set_no_show_all(False)
+        self.login_fallback_box.show_all()
+        self._clear_login_cookie_and_load(domain)
+
+    def _clear_login_cookie_and_load(self, domain: str) -> None:
+        # Same cookie-clearing dance as ui_saml_login.py and for the same
+        # reason: without it a stale/already-used session cookie could
+        # short-circuit the login and hand back nothing new to unlock the
+        # retry with.
+        if self._login_cancellable is not None:
+            self._login_cancellable.cancel()
+        self.login_webview.stop_loading()
+        self.login_webview.load_uri("about:blank")
+        cancellable = Gio.Cancellable()
+        self._login_cancellable = cancellable
+        manager = self.login_webview.get_website_data_manager()
+        manager.clear(WebKit2.WebsiteDataTypes.COOKIES, 0, cancellable, self._on_login_cookies_cleared, cancellable)
+
+    def _on_login_cookies_cleared(self, manager, result, cancellable) -> None:
+        if cancellable is not self._login_cancellable:
+            return  # superseded by a newer attempt, ignore
+        try:
+            manager.clear_finish(result)
+        except GLib.Error:
+            pass
+        self.login_webview.load_uri(f"https://{self._login_fallback_domain}/auth/saml/login?from=sslvpn_client")
+
+    def _on_login_webview_load_changed(self, webview, event) -> None:
+        if event != WebKit2.LoadEvent.FINISHED:
+            return
+        uri = webview.get_uri() or ""
+        if "sslvpn_success.shtml" not in uri:
+            return
+        qs = parse_qs(urlparse(uri).query)
+        if qs.get("result", [""])[0] != "success":
+            return  # login failed or ended the session; stay on the login page
+
+        # We don't need anything from this login (no token/user parsing) --
+        # its only job was to unlock the retry below. Fire that retry
+        # immediately, on a fresh request, while whatever this unlocked is
+        # still fresh (found empirically: leaving a connection idle for the
+        # minutes a real interactive login can take was long enough for it
+        # to time out server-side before a retry on it got attempted).
+        domain = self._login_fallback_domain
+        self._hide_login_fallback()
+        self.cert_path_label.set_text("Login OK -- fetching certificates...")
+        threading.Thread(
+            target=self._retry_cert_fetch_after_login, args=(domain,), daemon=True
+        ).start()
+
+    def _hide_login_fallback(self) -> None:
+        if self._login_cancellable is not None:
+            self._login_cancellable.cancel()
+            self._login_cancellable = None
+        self.login_webview.stop_loading()
+        self.login_webview.load_uri("about:blank")
+        self.login_fallback_box.hide()
+        self._login_fallback_domain = None
 
     def _on_save_clicked(self, _button) -> None:
         domain = self.domain_entry.get_text().strip()
