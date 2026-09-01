@@ -172,20 +172,32 @@ class NewProfileView:
         ).start()
 
     def _fetch_cert_worker(self, domain: str) -> None:
+        # Order matters here: MITM-capturing the real official client's own
+        # traffic against a real Firebox (accede.usm.cl) showed it always
+        # hits the lightweight login-config/status check FIRST and only
+        # requests the cert bundle after -- never the other way around, in
+        # every capture taken. Match that order rather than the reverse
+        # (which is what this used to do) in case some Fireboxes are
+        # stricter about request order than others -- confirmed NOT
+        # sufficient by itself to fix a 502 seen from one specific Firebox
+        # possibly doing extra client fingerprinting on the download
+        # action, but it's the documented real order regardless, so worth
+        # matching even without a guaranteed fix from it alone.
+        try:
+            login_config = vpn_network.fetch_login_config(domain)
+        except Exception:
+            # Best-effort: the SAML auth group comes from this separate,
+            # unrelated endpoint. A cert-only Firebox (SAML not configured)
+            # is a normal case, not a failure -- don't fail the whole fetch
+            # over it, just leave the group field alone if this errors.
+            login_config = None
+
         staging_dir = tempfile.mkdtemp(prefix="watchguard-vpn-fetch-")
         try:
             vpn_network.fetch_certificates_to_dir(domain, staging_dir)
         except Exception as e:
             GLib.idle_add(self._on_fetch_cert_done, domain, None, str(e), None)
             return
-        # Best-effort: the SAML auth group comes from a separate,
-        # unrelated endpoint. A cert-only Firebox (SAML not configured)
-        # is a normal case, not a failure -- don't fail the whole fetch
-        # over it, just leave the group field alone if this errors.
-        try:
-            login_config = vpn_network.fetch_login_config(domain)
-        except Exception:
-            login_config = None
         GLib.idle_add(self._on_fetch_cert_done, domain, staging_dir, None, login_config)
 
     def _on_fetch_cert_done(self, domain: str, staging_dir, error, login_config) -> None:
