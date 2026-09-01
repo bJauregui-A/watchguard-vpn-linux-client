@@ -82,10 +82,7 @@ class VpnWindow(Gtk.Window):
 
     def _build_profiles_page(self) -> None:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        box.set_margin_start(24)
-        box.set_margin_end(24)
-        box.set_margin_top(24)
-        box.set_margin_bottom(24)
+        box.set_border_width(24)
 
         title = Gtk.Label(label="Choose a domain")
         title.get_style_context().add_class("title")
@@ -115,10 +112,7 @@ class VpnWindow(Gtk.Window):
         else:
             for profile in self.profiles:
                 row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-                row_box.set_margin_top(6)
-                row_box.set_margin_bottom(6)
-                row_box.set_margin_start(6)
-                row_box.set_margin_end(6)
+                row_box.set_border_width(6)
                 label = Gtk.Label(label=profile.get("label") or profile["domain"])
                 label.set_xalign(0)
                 connect_btn = Gtk.Button(label="Connect")
@@ -204,10 +198,7 @@ class VpnWindow(Gtk.Window):
 
     def _build_new_profile_page(self) -> None:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        box.set_margin_start(24)
-        box.set_margin_end(24)
-        box.set_margin_top(24)
-        box.set_margin_bottom(24)
+        box.set_border_width(24)
 
         self.np_form_title = Gtk.Label(label="New domain")
         self.np_form_title.get_style_context().add_class("title")
@@ -533,10 +524,7 @@ class VpnWindow(Gtk.Window):
 
     def _build_credentials_login_page(self) -> None:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        box.set_margin_start(24)
-        box.set_margin_end(24)
-        box.set_margin_top(24)
-        box.set_margin_bottom(24)
+        box.set_border_width(24)
 
         back_btn = Gtk.Button(label="← Change domain")
         back_btn.set_halign(Gtk.Align.START)
@@ -575,10 +563,7 @@ class VpnWindow(Gtk.Window):
 
     def _build_status_page(self) -> None:
         status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        status_box.set_margin_start(24)
-        status_box.set_margin_end(24)
-        status_box.set_margin_top(24)
-        status_box.set_margin_bottom(24)
+        status_box.set_border_width(24)
 
         self.status_icon = Gtk.Image.new_from_icon_name(
             "network-vpn-acquiring-symbolic", Gtk.IconSize.DIALOG
