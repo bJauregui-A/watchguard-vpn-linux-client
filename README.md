@@ -146,9 +146,15 @@ would then need asking the server administrator.
   match the version in the repo.
 - Connection status is read live from the OpenVPN log stream (connected /
   reconnecting / error), rather than assumed from process exit status
-  alone.
+  alone. On failure, the log tail is checked against a few known OpenVPN
+  failure patterns (`AUTH_FAILED`, TLS handshake/certificate errors, DNS
+  resolution failures, connection refused) to show a specific hint
+  instead of just the exit code, when one is recognized.
 - A "Test connection" action pings the tunnel gateway and any DNS servers
   pushed by the server, to confirm the tunnel is actually passing traffic.
+- The domain list shows a warning next to any profile whose certificate
+  is already expired or expires within 30 days (checked via the `openssl`
+  CLI, already a transitive dependency via `openvpn`).
 
 ## Technical notes / known limitations
 

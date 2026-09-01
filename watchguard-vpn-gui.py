@@ -113,15 +113,26 @@ class VpnWindow(Gtk.Window):
             for profile in self.profiles:
                 row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
                 row_box.set_border_width(6)
+                label_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
                 label = Gtk.Label(label=profile.get("label") or profile["domain"])
                 label.set_xalign(0)
+                label_box.pack_start(label, False, False, 0)
+                cert_path = os.path.join(
+                    vpn_profiles.profile_cert_dir(profile["domain"]), "client.crt"
+                )
+                expiry_warning = vpn_network.check_cert_expiry(cert_path)
+                if expiry_warning:
+                    warn_label = Gtk.Label(label=f"⚠ certificate {expiry_warning}")
+                    warn_label.set_xalign(0)
+                    warn_label.get_style_context().add_class("dim-label")
+                    label_box.pack_start(warn_label, False, False, 0)
                 connect_btn = Gtk.Button(label="Connect")
                 connect_btn.connect("clicked", self._on_profile_chosen, profile)
                 edit_btn = Gtk.Button(label="Edit")
                 edit_btn.connect("clicked", self._on_profile_edit_clicked, profile)
                 remove_btn = Gtk.Button(label="Remove")
                 remove_btn.connect("clicked", self._on_profile_removed, profile)
-                row_box.pack_start(label, True, True, 0)
+                row_box.pack_start(label_box, True, True, 0)
                 row_box.pack_start(connect_btn, False, False, 0)
                 row_box.pack_start(edit_btn, False, False, 0)
                 row_box.pack_start(remove_btn, False, False, 0)

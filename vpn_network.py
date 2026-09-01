@@ -15,9 +15,12 @@ import subprocess
 import tarfile
 import urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from typing import Callable, Iterable, Optional, Tuple
 
 CERT_FILES = ("ca.crt", "client.crt", "client.pem")
+
+CERT_EXPIRY_WARN_DAYS = 30
 
 
 def check_wifi_health() -> Optional[str]:
@@ -53,6 +56,41 @@ def check_wifi_health() -> Optional[str]:
             )
     except Exception:
         pass
+    return None
+
+
+def check_cert_expiry(cert_path: str, warn_days: int = CERT_EXPIRY_WARN_DAYS) -> Optional[str]:
+    """Warns if a certificate is already expired or expiring soon.
+
+    Shells out to the `openssl` CLI rather than pulling in a crypto
+    library -- openssl is already a transitive dependency (openvpn links
+    against it), so this adds nothing new to install. Returns a short
+    fragment like "expires in 12d (2026-09-13)" or "expired 3d ago
+    (2026-08-29)", or None if it's not close to expiring (or the check
+    itself failed for any reason -- this is a convenience warning, not a
+    hard requirement, so failures are silent rather than surfaced)."""
+    try:
+        result = subprocess.run(
+            ["openssl", "x509", "-enddate", "-noout", "-in", cert_path],
+            capture_output=True, text=True, timeout=5,
+        )
+        m = re.search(r"notAfter=(.+)", result.stdout)
+        if not m:
+            return None
+        # openssl's format looks like "Sep  1 00:00:00 2027 GMT" (note the
+        # double space before a single-digit day, and a trailing timezone
+        # name strptime can't reliably parse) -- normalize both away. It's
+        # always UTC regardless of the abbreviation shown.
+        raw = " ".join(m.group(1).split())
+        raw = re.sub(r"\s+\S+$", "", raw)
+        expiry = datetime.strptime(raw, "%b %d %H:%M:%S %Y")
+        days_left = (expiry - datetime.utcnow()).days
+    except Exception:
+        return None
+    if days_left < 0:
+        return f"expired {-days_left}d ago ({expiry:%Y-%m-%d})"
+    if days_left <= warn_days:
+        return f"expires in {days_left}d ({expiry:%Y-%m-%d})"
     return None
 
 

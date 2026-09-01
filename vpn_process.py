@@ -14,6 +14,8 @@ import os
 import re
 import subprocess
 import threading
+from collections import deque
+from typing import Iterable, Optional
 
 from gi.repository import GLib, Gio
 
@@ -26,6 +28,55 @@ OVPN_TEMPLATE = os.path.join(BASE, "client.ovpn.template")
 AUTH_FILE = "/tmp/.watchguard-vpn-auth"
 LOG_FILE = "/tmp/watchguard-vpn-gui-openvpn.log"
 ACTIVE_OVPN_FILE = "/tmp/.watchguard-vpn-active.ovpn"
+
+# (pattern, human hint) pairs checked in order against the tail of the
+# openvpn log when a connection attempt fails, so the status page can show
+# something more useful than a bare exit code. First match wins -- ordered
+# roughly from "most specific / most commonly hit" to "more generic".
+_FAILURE_HINTS = (
+    (
+        re.compile(r"AUTH_FAILED"),
+        "Login was rejected by the server (AUTH_FAILED). If the "
+        "certificates are valid and the SAML login (or credentials) "
+        "itself succeeded, the SAML auth group for this domain is "
+        "probably wrong or missing -- edit the profile and check it.",
+    ),
+    (
+        re.compile(r"certificate verify failed|unable to get local issuer certificate"),
+        "The server's certificate could not be verified against ca.crt. "
+        "The Firebox's certificate may have been rotated -- try "
+        "re-fetching the certificates for this domain (Edit -> "
+        "Fetch automatically).",
+    ),
+    (
+        re.compile(r"TLS[ _]Error|TLS handshake failed|TLS key negotiation failed"),
+        "Could not establish a secure (TLS) connection to the server. "
+        "Check that the certificates for this domain are correct and "
+        "haven't expired, and that nothing (firewall, wrong port) is "
+        "blocking the connection.",
+    ),
+    (
+        re.compile(r"Cannot resolve host address|RESOLVE:"),
+        "Could not resolve the domain name. Check it's typed correctly "
+        "and that you have a working internet/DNS connection.",
+    ),
+    (
+        re.compile(r"Connection refused|Network is unreachable|No route to host"),
+        "Could not reach the server. Check the domain is correct and "
+        "that the server is actually up and reachable from this network.",
+    ),
+)
+
+
+def classify_openvpn_failure(log_lines: Iterable[str]) -> Optional[str]:
+    """Scans recent openvpn log lines for a known failure pattern and
+    returns a human hint for it, or None if nothing recognizable was
+    found (caller falls back to the bare exit code in that case)."""
+    text = "\n".join(log_lines)
+    for pattern, hint in _FAILURE_HINTS:
+        if pattern.search(text):
+            return hint
+    return None
 
 
 class VpnProcess:
@@ -126,6 +177,10 @@ class VpnProcess:
         stdout = self.proc.get_stdout_pipe()
         stream = Gio.DataInputStream.new(stdout)
         connected = False
+        # Only the tail matters for classify_openvpn_failure -- capped so a
+        # long-lived, chatty connection can't grow this unbounded in memory
+        # (the full log is already on disk at LOG_FILE regardless).
+        recent_lines = deque(maxlen=200)
         with open(LOG_FILE, "w") as logf:
             while True:
                 line, _ = stream.read_line_utf8()
@@ -133,6 +188,7 @@ class VpnProcess:
                     break
                 logf.write(line + "\n")
                 logf.flush()
+                recent_lines.append(line)
                 GLib.idle_add(self._on_log_line, line)
                 if "PUSH_REPLY" in line:
                     gw_m = re.search(r"route-gateway (\d+\.\d+\.\d+\.\d+)", line)
@@ -169,11 +225,10 @@ class VpnProcess:
         self.proc.wait()
         if not connected:
             exit_code = self.proc.get_exit_status()
-            GLib.idle_add(
-                self._on_status,
-                "error",
-                f"openvpn exited (code {exit_code}). Full log: {LOG_FILE}",
-            )
+            hint = classify_openvpn_failure(recent_lines)
+            base = f"openvpn exited (code {exit_code}). Full log: {LOG_FILE}"
+            message = f"{hint}\n\n{base}" if hint else base
+            GLib.idle_add(self._on_status, "error", message)
         GLib.idle_add(self._on_exited, session_id)
 
     def _route_cleanup_command(self) -> str:
