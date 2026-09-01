@@ -11,16 +11,16 @@ import os
 import tempfile
 import threading
 from typing import Optional
-from urllib.parse import parse_qs, urlparse
 
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("WebKit2", "4.1")
-from gi.repository import Gtk, GLib, Gio, WebKit2  # noqa: E402
+from gi.repository import Gtk, GLib, WebKit2  # noqa: E402
 
 import vpn_network
 import vpn_profiles
+from ui_saml_common import SamlWebViewController
 
 
 class NewProfileView:
@@ -32,7 +32,6 @@ class NewProfileView:
         self._editing_domain: Optional[str] = None
         self._cert_folder: Optional[str] = None
         self._login_fallback_domain: Optional[str] = None  # non-None while the embedded login-first-then-retry flow (see below) is active
-        self._login_cancellable = None  # guards the login webview's cookie-clear against a stale/overlapping attempt, same pattern as ui_saml_login.py
 
         self.widget = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         self.widget.set_border_width(24)
@@ -129,7 +128,7 @@ class NewProfileView:
         login_fallback_label.set_line_wrap(True)
         self.login_webview = WebKit2.WebView()
         self.login_webview.set_size_request(-1, 320)
-        self.login_webview.connect("load-changed", self._on_login_webview_load_changed)
+        self._login_controller = SamlWebViewController(self.login_webview, self._on_login_success)
         self.login_fallback_box.pack_start(login_fallback_label, False, False, 0)
         self.login_fallback_box.pack_start(self.login_webview, True, True, 0)
         self.login_fallback_box.set_no_show_all(True)
@@ -205,18 +204,23 @@ class NewProfileView:
             target=self._fetch_cert_worker, args=(domain,), daemon=True
         ).start()
 
-    def _fetch_cert_worker(self, domain: str) -> None:
-        # Order matters here: MITM-capturing the real official client's own
-        # traffic against a real Firebox (accede.usm.cl) showed it always
-        # hits the lightweight login-config/status check FIRST and only
-        # requests the cert bundle after -- never the other way around, in
-        # every capture taken. Match that order rather than the reverse
-        # (which is what this used to do) in case some Fireboxes are
-        # stricter about request order than others -- confirmed NOT
-        # sufficient by itself to fix a 502 seen from one specific Firebox
-        # possibly doing extra client fingerprinting on the download
-        # action, but it's the documented real order regardless, so worth
-        # matching even without a guaranteed fix from it alone.
+    @staticmethod
+    def _run_cert_fetch(domain: str):
+        """Fetches login-config (best-effort) then the cert bundle for
+        domain, in the documented real order -- MITM-capturing the real
+        official client's own traffic against a real Firebox showed it
+        always hits the lightweight login-config/status check FIRST and
+        only requests the cert bundle after, never the other way around.
+        Matching that order isn't sufficient by itself to fix a 502 seen
+        from one specific Firebox (see the login_fallback_box comment
+        below for what was), but it's the documented real order
+        regardless. Shared by the initial attempt and the login-fallback
+        retry below -- they used to each have their own near-identical
+        copy of this, in two different (inconsistent) orders.
+
+        Returns (staging_dir, error, login_config) -- staging_dir is None
+        iff error is set. Runs on a background thread; callers marshal
+        the result back via GLib.idle_add themselves."""
         try:
             login_config = vpn_network.fetch_login_config(domain)
         except Exception:
@@ -230,6 +234,12 @@ class NewProfileView:
         try:
             vpn_network.fetch_certificates_to_dir(domain, staging_dir)
         except Exception as e:
+            return None, str(e), login_config
+        return staging_dir, None, login_config
+
+    def _fetch_cert_worker(self, domain: str) -> None:
+        staging_dir, error, login_config = self._run_cert_fetch(domain)
+        if error:
             # Some Fireboxes now reject this anonymous request but accept
             # it right after a real login from the same client (see the
             # login_fallback_box comment above) -- worth trying that before
@@ -239,7 +249,7 @@ class NewProfileView:
             if login_config and login_config.get("saml_enabled"):
                 GLib.idle_add(self._start_login_fallback, domain)
             else:
-                GLib.idle_add(self._on_fetch_cert_done, domain, None, str(e), None)
+                GLib.idle_add(self._on_fetch_cert_done, domain, None, error, None)
             return
         GLib.idle_add(self._on_fetch_cert_done, domain, staging_dir, None, login_config)
 
@@ -247,17 +257,8 @@ class NewProfileView:
         """Same as _fetch_cert_worker, but called after the login-fallback
         webview reports a completed login -- no need to re-check
         saml_enabled or fall back again, this IS the fallback."""
-        staging_dir = tempfile.mkdtemp(prefix="watchguard-vpn-fetch-")
-        try:
-            vpn_network.fetch_certificates_to_dir(domain, staging_dir)
-        except Exception as e:
-            GLib.idle_add(self._on_fetch_cert_done, domain, None, str(e), None)
-            return
-        try:
-            login_config = vpn_network.fetch_login_config(domain)
-        except Exception:
-            login_config = None
-        GLib.idle_add(self._on_fetch_cert_done, domain, staging_dir, None, login_config)
+        staging_dir, error, login_config = self._run_cert_fetch(domain)
+        GLib.idle_add(self._on_fetch_cert_done, domain, staging_dir, error, login_config)
 
     def _on_fetch_cert_done(self, domain: str, staging_dir, error, login_config) -> None:
         self.cert_fetch_btn.set_sensitive(True)
@@ -290,47 +291,17 @@ class NewProfileView:
         self.error_label.set_text("")
         self.login_fallback_box.set_no_show_all(False)
         self.login_fallback_box.show_all()
-        self._clear_login_cookie_and_load(domain)
+        self._login_controller.load_login(domain)
 
-    def _clear_login_cookie_and_load(self, domain: str) -> None:
-        # Same cookie-clearing dance as ui_saml_login.py and for the same
-        # reason: without it a stale/already-used session cookie could
-        # short-circuit the login and hand back nothing new to unlock the
-        # retry with.
-        if self._login_cancellable is not None:
-            self._login_cancellable.cancel()
-        self.login_webview.stop_loading()
-        self.login_webview.load_uri("about:blank")
-        cancellable = Gio.Cancellable()
-        self._login_cancellable = cancellable
-        manager = self.login_webview.get_website_data_manager()
-        manager.clear(WebKit2.WebsiteDataTypes.COOKIES, 0, cancellable, self._on_login_cookies_cleared, cancellable)
-
-    def _on_login_cookies_cleared(self, manager, result, cancellable) -> None:
-        if cancellable is not self._login_cancellable:
-            return  # superseded by a newer attempt, ignore
-        try:
-            manager.clear_finish(result)
-        except GLib.Error:
-            pass
-        self.login_webview.load_uri(f"https://{self._login_fallback_domain}/auth/saml/login?from=sslvpn_client")
-
-    def _on_login_webview_load_changed(self, webview, event) -> None:
-        if event != WebKit2.LoadEvent.FINISHED:
-            return
-        uri = webview.get_uri() or ""
-        if "sslvpn_success.shtml" not in uri:
-            return
-        qs = parse_qs(urlparse(uri).query)
-        if qs.get("result", [""])[0] != "success":
-            return  # login failed or ended the session; stay on the login page
-
-        # We don't need anything from this login (no token/user parsing) --
-        # its only job was to unlock the retry below. Fire that retry
-        # immediately, on a fresh request, while whatever this unlocked is
-        # still fresh (found empirically: leaving a connection idle for the
-        # minutes a real interactive login can take was long enough for it
-        # to time out server-side before a retry on it got attempted).
+    def _on_login_success(self, qs: dict) -> None:
+        # We don't need anything from this login (no token/user parsing --
+        # SamlWebViewController already confirmed result=success and that
+        # the redirect genuinely came from the Firebox) -- its only job
+        # was to unlock the retry below. Fire that retry immediately, on a
+        # fresh request, while whatever this unlocked is still fresh
+        # (found empirically: leaving a connection idle for the minutes a
+        # real interactive login can take was long enough for it to time
+        # out server-side before a retry on it got attempted).
         domain = self._login_fallback_domain
         self._hide_login_fallback()
         self.cert_path_label.set_text("Login OK -- fetching certificates...")
@@ -339,11 +310,7 @@ class NewProfileView:
         ).start()
 
     def _hide_login_fallback(self) -> None:
-        if self._login_cancellable is not None:
-            self._login_cancellable.cancel()
-            self._login_cancellable = None
-        self.login_webview.stop_loading()
-        self.login_webview.load_uri("about:blank")
+        self._login_controller.stop_and_blank()
         self.login_fallback_box.hide()
         self._login_fallback_domain = None
 
