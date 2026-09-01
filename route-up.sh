@@ -13,6 +13,16 @@
 
 ORIG_ROUTE_FILE=/tmp/.watchguard-vpn-orig-route
 
+# Set by `setenv TUNNEL_MTU_HINT 1400` in client.ovpn.template (falls back
+# to the same 1400 if this script is ever run standalone/by hand without
+# that env var present). Pinned on the host route to the Firebox's IP
+# below -- see that template for the full reasoning: this defends the
+# OUTER OpenVPN TCP connection against Path-MTU-Discovery black holes
+# (common on mobile carrier NATs that drop the ICMP PMTUD relies on)
+# WITHOUT touching any system-wide sysctl, since it's attached to a route
+# that only ever matches traffic to the Firebox itself.
+TUNNEL_MTU_HINT="${TUNNEL_MTU_HINT:-1400}"
+
 if [ -f "$ORIG_ROUTE_FILE" ]; then
     # Line 1: the original default route (used to reinforce the gateway
     # itself). Line 2: the actual pre-VPN route specifically to the
@@ -47,9 +57,9 @@ if [ -f "$ORIG_ROUTE_FILE" ]; then
     # there wasn't.
     if [ -n "$trusted_ip" ] && [ -n "$SERVER_IF" ]; then
         if [ -n "$SERVER_GW" ]; then
-            ip route replace "${trusted_ip}/32" via "$SERVER_GW" dev "$SERVER_IF" 2>/dev/null
+            ip route replace "${trusted_ip}/32" via "$SERVER_GW" dev "$SERVER_IF" mtu "$TUNNEL_MTU_HINT" 2>/dev/null
         else
-            ip route replace "${trusted_ip}/32" dev "$SERVER_IF" 2>/dev/null
+            ip route replace "${trusted_ip}/32" dev "$SERVER_IF" mtu "$TUNNEL_MTU_HINT" 2>/dev/null
         fi
     fi
     # The state file is NOT removed here: route-up fires again on every
