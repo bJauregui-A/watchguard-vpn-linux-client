@@ -13,7 +13,6 @@ import os
 import re
 import subprocess
 import tarfile
-import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Callable, Iterable, Optional, Tuple
