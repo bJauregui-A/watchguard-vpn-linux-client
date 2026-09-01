@@ -32,6 +32,22 @@ tls-version-min 1.2
 # each SSH keystroke) before sending them -- it doesn't remove the
 # underlying issue but noticeably reduces the perceived delay.
 tcp-nodelay
+# mssfix caps the MSS of TCP flows carried *inside* the tunnel (SSH,
+# HTTPS, etc. -- not the outer OpenVPN TCP connection itself) so their
+# segments arrive already small enough to survive the tunnel's own
+# overhead, instead of relying on Path MTU Discovery. That matters
+# specifically on mobile networks/hotspots: many carrier NATs silently
+# drop the ICMP "fragmentation needed" replies PMTUD depends on, so an
+# oversized segment doesn't get resized -- it just vanishes and waits for
+# a full TCP retransmission timeout, which shows up as a multi-hundred-ms
+# latency spike (observed on a phone hotspot: 50-300ms baseline jitter
+# plus occasional 350-580ms spikes). 1400 is a conservative value that
+# leaves headroom for whatever extra encapsulation the mobile carrier's
+# own network adds on top. Complements tcp-nodelay above (that one
+# addresses buffering/Nagle; this one addresses fragmentation/PMTUD) --
+# neither can fully remove the underlying TCP-over-TCP effect, since the
+# Firebox gives no UDP alternative to switch to.
+mssfix 1400
 # Split-tunnel: only the resources the Firebox pushes via PUSH_REPLY go
 # through the VPN. We tried full-tunnel (redirect-gateway def1) and the
 # Firebox didn't forward general internet traffic -- it just broke the
